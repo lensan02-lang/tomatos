@@ -139,7 +139,7 @@ def loss(config, metrics):
     loss = r"$CL_s$" if "cls" in config.objective else "BCE"
     plt.ylabel(f"{loss} Loss")
     train_loss_finite = metrics["train_loss"][np.isfinite(metrics["train_loss"][:])]
-    plt.ylim(top=1.0)
+    plt.ylim(top=1.0, bottom=0.0)
     fig_finalize(config, "loss.pdf")
 
 

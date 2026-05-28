@@ -91,7 +91,8 @@ def loss_fn(
             cls = neos.loss_from_model(model, loss="cls")
             # fall back to BCE when CLs is NaN (unstable pyhf fit);
             # zero_nans() in the optimizer zeroes the NaN gradient from cls
-            loss_value = jnp.where(jnp.isnan(cls), bce_loss, cls)
+            cls_is_nan = jnp.isnan(cls)
+            loss_value = jnp.where(cls_is_nan, bce_loss, cls)
 
     if not validate_only:
             loss_value = tomatos.constraints.penalize_loss(loss_value, hists)

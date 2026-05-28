@@ -269,7 +269,11 @@ def run(config):
         tomatos.utils.clear_caches(config)
 
         end = perf_counter()
-        logging.info(f"train loss: {state.value}")
+        if config.objective in ["cls_nn", "cls_var"]:
+            loss_mode = "bce (warmup)" if i < config.bce_warmup_steps else "cls"
+        else:
+            loss_mode = config.objective
+        logging.info(f"train loss: {state.value} [{loss_mode}]")
         logging.info(f"test loss: {test_loss}")
         logging.info(f"update took {end-start:.4f}s")
         logging.info("\n")
