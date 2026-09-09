@@ -1,5 +1,6 @@
 import pprint
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pyhf
@@ -27,14 +28,6 @@ def get_generator_weight_envelope(hists):
     return envelope_up, envelope_down
 
 
-def get_abcd_weight(A, B):
-    w_CR = A / B
-    errA = jnp.sqrt(A)
-    errB = jnp.sqrt(B)
-    stat_err_w_CR = w_CR * jnp.sqrt(jnp.square(errA / A) + jnp.square(errB / B))
-    return w_CR, stat_err_w_CR
-
-
 def symmetric_up_down_sf(nom, sys):
     relative = jnp.abs((nom - sys) / nom)
     up = 1 + relative
@@ -56,69 +49,124 @@ def zero_protect(hists, thresh=0.001):
         return jnp.where(hists < thresh, thresh, hists)
 
 
-def hist_transforms(hists, validate_only):
+def sum_added_back(hists, region, samples, nominal):
+    nosys = 0.0
+    stat_var = 0.0
+    for sample in samples:
+        nom = hists[region][sample][nominal]
+        sigma = hists[region][sample]["STAT_1UP"] - nom
+        nosys = nosys + nom
+        stat_var = stat_var + jnp.square(sigma)
+    return nosys, jnp.sqrt(stat_var)
+
+
+def hist_transforms(hists, config, validate_only, update_bkg_shape=False):
 
     # protect for e.g. divisions in the following
     hists = zero_protect(hists)
-    # aim to scale btag_1 to btag_2 in SR from ratio in CR
-    w_CR, stat_err_w_CR = get_abcd_weight(
-        A=jnp.sum(hists["CR_btag_2"]["bkg"]["NOSYS"]),
-        B=jnp.sum(hists["CR_btag_1"]["bkg"]["NOSYS"]),
-    )
-    """print("CR2/CR1:", hists["CR_btag_2"]["bkg"]["NOSYS"], "/", hists["CR_btag_1"]["bkg"]["NOSYS"])
-    print("SR1:", hists["SR_btag_1"]["bkg"]["NOSYS"])
-    plt.hist2d(hists["CR_btag_2"]["bkg"]["NOSYS"], hists["CR_btag_1"]["bkg"]["NOSYS"], bins=50)
-    plt.xlabel("CR_btag_2")
-    plt.ylabel("CR_btag_1")
-    plt.title("CR Ratio")
-    plt.yscale("log")
-    plt.xscale
-    plt.colorbar()
-    plt.show()"""
-    #print("ABCD weight (CR2/CR1):", w_CR, "+-", stat_err_w_CR)
 
     hists["SR_btag_2"]["bkg_estimate"] = {}
-    # scale single tagged for bkg estimate
-    hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] = (
-        hists["SR_btag_1"]["bkg"]["NOSYS"] * w_CR
-        
+    hists["CR_btag_2"]["bkg_estimate"] = {}
+
+    raw_SR_NOSYS = hists["SR_btag_2"]["bkg_estimate_raw"]["NOSYS"]
+    raw_SR_STAT_1UP = hists["SR_btag_2"]["bkg_estimate_raw"]["STAT_1UP"]
+    raw_SR_STAT_1DOWN = hists["SR_btag_2"]["bkg_estimate_raw"]["STAT_1DOWN"]
+    raw_CR_NOSYS = hists["CR_btag_2"]["bkg_estimate_raw"]["NOSYS"]
+    raw_CR_STAT_1UP = hists["CR_btag_2"]["bkg_estimate_raw"]["STAT_1UP"]
+    raw_CR_STAT_1DOWN = hists["CR_btag_2"]["bkg_estimate_raw"]["STAT_1DOWN"]
+
+    # add back the direct MC prediction of every sample removed from the
+    # 1-tag/CR data above (e.g. ttbar) - see sum_added_back(). its own MC
+    # stat error enters the STAT band combined in quadrature with the data
+    # stat error already in there, since the two are independent sources.
+    added_SR_NOSYS, added_SR_STAT_sigma = sum_added_back(
+        hists, "SR_btag_2", config.subtract_from_data, config.nominal
     )
-    # current hack until proper diffable norm/stat modifier
-    hists["SR_btag_2"]["bkg_estimate"]["STAT_1UP"] = (
-        hists["SR_btag_1"]["bkg"]["STAT_1UP"] * w_CR
-    )
-    hists["SR_btag_2"]["bkg_estimate"]["STAT_1DOWN"] = (
-        hists["SR_btag_1"]["bkg"]["STAT_1DOWN"] * w_CR
+    added_CR_NOSYS, added_CR_STAT_sigma = sum_added_back(
+        hists, "CR_btag_2", config.subtract_from_data, config.nominal
     )
 
-    # norm uncertainty background estimate
-    w_CR_stat_up, w_CR_stat_down = symmetric_up_down_sf(w_CR, w_CR + stat_err_w_CR)
-    hists["SR_btag_2"]["bkg_estimate"]["NORM_1UP"] = (
-        hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * w_CR_stat_up
+    hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] = raw_SR_NOSYS + added_SR_NOSYS
+    hists["SR_btag_2"]["bkg_estimate"]["STAT_1UP"] = hists["SR_btag_2"]["bkg_estimate"][
+        "NOSYS"
+    ] + jnp.sqrt(
+        jnp.square(raw_SR_STAT_1UP - raw_SR_NOSYS) + jnp.square(added_SR_STAT_sigma)
     )
-    hists["SR_btag_2"]["bkg_estimate"]["NORM_1DOWN"] = (
-        hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * w_CR_stat_down
+    hists["SR_btag_2"]["bkg_estimate"]["STAT_1DOWN"] = hists["SR_btag_2"]["bkg_estimate"][
+        "NOSYS"
+    ] - jnp.sqrt(
+        jnp.square(raw_SR_NOSYS - raw_SR_STAT_1DOWN) + jnp.square(added_SR_STAT_sigma)
     )
 
-    # i leave this as its illustrative to what you could do
-    # Backround Shape Uncertainty
-    # don't use this when optimizing --> sculpting
-    if validate_only:
-        hists["VR_btag_2"]["bkg_estimate"] = {}
+    hists["CR_btag_2"]["bkg_estimate"]["NOSYS"] = raw_CR_NOSYS + added_CR_NOSYS
+    hists["CR_btag_2"]["bkg_estimate"]["STAT_1UP"] = hists["CR_btag_2"]["bkg_estimate"][
+        "NOSYS"
+    ] + jnp.sqrt(
+        jnp.square(raw_CR_STAT_1UP - raw_CR_NOSYS) + jnp.square(added_CR_STAT_sigma)
+    )
+    hists["CR_btag_2"]["bkg_estimate"]["STAT_1DOWN"] = hists["CR_btag_2"]["bkg_estimate"][
+        "NOSYS"
+    ] - jnp.sqrt(
+        jnp.square(raw_CR_NOSYS - raw_CR_STAT_1DOWN) + jnp.square(added_CR_STAT_sigma)
+    )
+    cr_pred = hists["CR_btag_2"]["bkg_estimate"]["NOSYS"]
+    cr_data = hists["CR_btag_2"]["data"]["NOSYS"]
+    cr_pred_stat_up = hists["CR_btag_2"]["bkg_estimate"]["STAT_1UP"]
+    cr_data_stat_up = hists["CR_btag_2"]["data"]["STAT_1UP"]
 
-        hists["VR_btag_2"]["bkg_estimate"]["NOSYS"] = (
-            hists["VR_btag_1"]["bkg"]["NOSYS"] * w_CR
-        )
-        bkg_shapesys_up, bkg_shapesys_down = symmetric_up_down_sf(
-            hists["VR_btag_2"]["bkg_estimate"]["NOSYS"],
-            hists["VR_btag_2"]["bkg"]["NOSYS"],
-        )
-        hists["SR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1UP"] = (
-            hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * bkg_shapesys_up
-        )
-        hists["SR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1DOWN"] = (
-            hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * bkg_shapesys_down
-        )
+    abs_dev = cr_data - cr_pred
+
+    # statistical uncertainty of abs_dev, from the (independent) Poisson/
+    # weighted-stat errors on cr_data and cr_pred
+    sigma_cr_data = cr_data_stat_up - cr_data
+    sigma_cr_pred = cr_pred_stat_up - cr_pred
+    sigma_abs_dev = jnp.sqrt(sigma_cr_data**2 + sigma_cr_pred**2)
+
+    
+    safe_cr_pred = cr_pred > 0.02
+    rel_dev = jnp.where(safe_cr_pred, abs_dev / cr_pred, 0.0)
+    sigma_rel_dev = jnp.where(safe_cr_pred, sigma_abs_dev / cr_pred, 0.0)
+
+    significant_dev = jnp.sqrt(
+        jnp.maximum(rel_dev**2 - sigma_rel_dev**2, 0.0)
+    )
+    # block gradient through the size of this systematic - it still enters
+    # the CLs value normally (train and eval see the same loss), but the
+    # fit can't reduce it by reshaping cuts/NN output to make CR appear
+    # to close better; only the underlying NOSYS (still fully
+    # differentiable) can be improved
+    significant_dev = jax.lax.stop_gradient(significant_dev)
+    config._bkg_shape_dev = significant_dev
+
+    nosys = hists["SR_btag_2"]["bkg_estimate"]["NOSYS"]
+    cached = getattr(config, "_bkg_shape_dev", None)
+    significant_dev = (
+        cached if cached is not None and cached.shape == nosys.shape
+        else jnp.zeros_like(nosys)
+    )
+
+    # symmetric: widen both sides by the same relative significant
+    # deviation, regardless of which direction the CR non-closure points
+    # in. Multiplicative, applied to each region's own NOSYS 
+    shape_up = 1.0 + significant_dev
+    shape_down = jnp.maximum(1.0 - significant_dev, 0.0)
+
+    hists["SR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1UP"] = (
+        hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * shape_up
+    )
+    hists["SR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1DOWN"] = (
+        hists["SR_btag_2"]["bkg_estimate"]["NOSYS"] * shape_down
+    )
+
+    # apply to CR (same relative significant_dev, so the constraint from CR
+    # actually feeds back consistently)
+    hists["CR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1UP"] = (
+        hists["CR_btag_2"]["bkg_estimate"]["NOSYS"] * shape_up
+    )
+    hists["CR_btag_2"]["bkg_estimate"]["BKG_SHAPE_1DOWN"] = (
+        hists["CR_btag_2"]["bkg_estimate"]["NOSYS"] * shape_down
+    )
+
     # e.g. if generator weights are available
     # hists["gen_up"], hists["gen_down"] = get_generator_weight_envelope(hists)
 
@@ -128,53 +176,53 @@ def hist_transforms(hists, validate_only):
     return hists
 
 
-def get_modifiers(hists, config, validate_only=False):
-    modifiers = {k: [] for k in hists[config.fit_region]}
-    # autocollect 1UP 1DOWN
-    for sample in hists[config.fit_region]:
-        for sys in hists[config.fit_region][sample]:
+
+def get_modifiers(hists, region, config, validate_only=False):
+    modifiers = {k: [] for k in hists[region]}
+    # samples whose STAT uncertainty gets one nuisance parameter per bin
+    # instead of a single bin-correlated shift, so the fit can correct
+    # bin-by-bin mismatches (e.g. under-predicting one bin and
+    # over-predicting the next) instead of only being able to shift the
+    # whole histogram up or down together
+    per_bin_stat_samples = ["bkg_estimate"]
+
+    for sample in hists[region]:
+        for sys in hists[region][sample]:
             if "1UP" in sys:
                 if "MY_SF_UNC" in sys:
                     continue
                 sys = sys.replace("_1UP", "")
+                if sys == "STAT" and sample in per_bin_stat_samples:
+                    continue  # handled per-bin below instead
+                mod_name = f"{sys}_{sample}" if sys == "STAT" else sys
                 modifiers[sample] += (
                     {
-                        "name": sys,
+                        "name": mod_name,
                         "type": "histosys",
                         "data": {
-                            "hi_data": hists[config.fit_region][sample][sys + "_1UP"],
-                            "lo_data": hists[config.fit_region][sample][sys + "_1DOWN"],
+                            "hi_data": hists[region][sample][sys + "_1UP"],
+                            "lo_data": hists[region][sample][sys + "_1DOWN"],
                         },
                     },
                 )
 
-    # this an ad-hoc hack for stat uncertainty, and nothing more than
-    # that until we have the diffable modifier. Blows up the number of fit
-    # parameters unnecessarily for stat unc, which instead of having one
-    # parameter per bin, histosy makes a parameter for each bin per
-    # modifier
-    for sample in [*config.samples]:
-        if sample == "bkg":
+    
+    for sample in per_bin_stat_samples:
+        if sample not in hists[region]:
             continue
-        if sample == config.signal_sample:
-            continue
+        nom = hists[region][sample][config.nominal]
+        stat_up = hists[region][sample]["STAT_1UP"]
+        stat_down = hists[region][sample]["STAT_1DOWN"]
         for i in range(len(config.bins) - 1):
-            nom = hists[config.fit_region][sample][config.nominal]
-            nom_up = jnp.copy(nom)
-            stat_up_i = nom_up.at[i].set(
-                hists[config.fit_region][sample]["STAT_1UP"][i]
-            )
-            nom_down = jnp.copy(nom)
-            stat_down_i = nom_down.at[i].set(
-                hists[config.fit_region][sample]["STAT_1DOWN"][i]
-            )
+            hi = jnp.copy(nom).at[i].set(stat_up[i])
+            lo = jnp.copy(nom).at[i].set(stat_down[i])
             modifiers[sample] += (
                 {
-                    "name": f"STAT_{i+1}",
+                    "name": f"STAT_{sample}_bin{i + 1}",
                     "type": "histosys",
                     "data": {
-                        "hi_data": jnp.copy(stat_up_i),
-                        "lo_data": jnp.copy(stat_down_i),
+                        "hi_data": hi,
+                        "lo_data": lo,
                     },
                 },
             )
@@ -182,74 +230,50 @@ def get_modifiers(hists, config, validate_only=False):
     return modifiers
 
 
-def sample_spec_from_modifiers(hists, config, modifiers, samples):
-    # this list is empty here since these are the only two samples, but  auto
-    # sets up the modifiers for all up down uncertainties
-    sample_spec = [
+def sample_spec_from_modifiers(hists, region, config, modifiers, samples):
+    return [
         {
             "name": sample,
-            "data": hists[config.fit_region][sample][config.nominal],
+            "data": hists[region][sample][config.nominal],
             "modifiers": modifiers[sample],
         }
         for sample in samples
     ]
 
-    return sample_spec
-
 
 def pyhf_model(hists, config, validate_only=False):
-    # here you builds the json worspace structure with hists
-
-    # standard uncerainty modifiers per sample
-    # enforce 1UP, 1DOWN for autosetup here
-    modifiers = get_modifiers(hists, config, validate_only=validate_only)
-
-    sample_spec = sample_spec_from_modifiers(
-        hists, config, modifiers, samples=["bkg"]
+    modifiers_SR = get_modifiers(hists, config.fit_region, config, validate_only)
+    sample_spec_SR = sample_spec_from_modifiers(
+        hists, config.fit_region, config, modifiers_SR, samples=["bkg_estimate"]
     )
-    # this is the workspace jsons
-    spec = {
-        "channels": [
-            {
-                "name": config.fit_region,
-                "samples": [
-                    # signal sample
-                    {
-                        "name": config.signal_sample,
-                        "data": hists[config.fit_region][config.signal_sample][
-                            config.nominal
-                        ],
-                        "modifiers": [
-                            # signal strength modifier (parameter of interest)
-                            {
-                                "name": "mu",
-                                "type": "normfactor",
-                                "data": None,
-                            },
-                            # My custom scale factor uncertainty
-                            {
-                                "name": "MY_SF_UNC",
-                                "type": "histosys",
-                                "data": {
-                                    "hi_data": hists["SR_btag_2"]["ggZH125_vvbb"][
-                                        "MY_SF_UNC_1UP"
-                                    ],
-                                    "lo_data": hists["SR_btag_2"]["ggZH125_vvbb"][
-                                        "MY_SF_UNC_1DOWN"
-                                    ],
-                                },
-                            },
-                            *modifiers[config.signal_sample],
-                        ],
-                    },
-                    *sample_spec,
-                ],
-            }
-        ],
-    }
 
-    # # this is very handy for debugging when you turn off jit in the main.py
-    # if config.debug:
+    spec = {
+    "channels": [
+        {
+            "name": config.fit_region,  # SR_btag_2
+            "samples": [
+                {
+                    "name": config.signal_sample,
+                    "data": hists[config.fit_region][config.signal_sample][config.nominal],
+                    "modifiers": [
+                        {"name": "mu", "type": "normfactor", "data": None},
+                        {
+                            "name": "MY_SF_UNC",
+                            "type": "histosys",
+                            "data": {
+                                "hi_data": hists["SR_btag_2"]["ggZH125_vvbb"]["MY_SF_UNC_1UP"],
+                                "lo_data": hists["SR_btag_2"]["ggZH125_vvbb"]["MY_SF_UNC_1DOWN"],
+                            },
+                        },
+                        *modifiers_SR[config.signal_sample],
+                    ],
+                },
+                *sample_spec_SR,
+            ],
+        },
+    ],
+}
+
     #pprint.pprint(spec)
 
     return pyhf.Model(spec, validate=False), hists

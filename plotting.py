@@ -132,15 +132,45 @@ def plot_bkg_estimate(config, hists):
 
 
 def loss(config, metrics):
-    plt.plot(interpolate_gaps(metrics["train_loss"]), label=r"train", linewidth=0.75)
-    plt.plot(interpolate_gaps(metrics["valid_loss"]), label=r"valid", linewidth=0.75)
     plt.plot(interpolate_gaps(metrics["test_loss"]), label=r"test", linewidth=0.75)
+    plt.plot(interpolate_gaps(metrics["valid_loss"]), label=r"valid", linewidth=0.75)
+    plt.plot(interpolate_gaps(metrics["train_loss"]), label=r"train", linewidth=0.75)
     plt.xlabel("Batch")
     loss = r"$CL_s$" if "cls" in config.objective else "BCE"
     plt.ylabel(f"{loss} Loss")
     train_loss_finite = metrics["train_loss"][np.isfinite(metrics["train_loss"][:])]
     plt.ylim(top=1.0, bottom=0.0)
     fig_finalize(config, "loss.pdf")
+
+    if "cls" in config.objective and "valid_cls" in metrics:
+        has_discovery = True #"valid_discovery" in metrics
+        n_rows = 3 if has_discovery else 2
+        fig, axes = plt.subplots(n_rows, 1, figsize=(8, 4 * n_rows), sharex=True)
+        ax1, ax2 = axes[0], axes[1]
+        ax1.plot(interpolate_gaps(metrics["test_cls"]), label="test CLs", linewidth=0.75)
+        ax1.plot(interpolate_gaps(metrics["valid_cls"]), label="valid CLs", linewidth=0.75)
+        ax1.plot(interpolate_gaps(metrics["train_cls"]), label="train CLs", linewidth=0.75)
+        ax1.set_ylabel(r"$CL_s$")
+        ax1.set_ylim(0, 1)
+        ax1.legend()
+        ax2.plot(interpolate_gaps(metrics["test_bce"]), label="test BCE", linewidth=0.75)
+        ax2.plot(interpolate_gaps(metrics["valid_bce"]), label="valid BCE", linewidth=0.75)
+        ax2.plot(interpolate_gaps(metrics["train_bce"]), label="train BCE", linewidth=0.75)
+        ax2.set_ylabel("BCE")
+        ax2.legend()
+        if  has_discovery:
+            ax3 = axes[2]
+            ax3.plot(interpolate_gaps(metrics["train_discovery"]), label="train", linewidth=0.75)
+            ax3.plot(interpolate_gaps(metrics["valid_discovery"]), label="valid", linewidth=0.75)
+            ax3.plot(interpolate_gaps(metrics["test_discovery"]), label="test", linewidth=0.75)
+            ax3.set_ylabel(r"discovery $Z$")
+            ax3.set_xlabel("Batch")
+            ax3.legend()
+        else:
+            ax2.set_xlabel("Batch")
+        fig.tight_layout()
+        fig.savefig(config.plot_path + "loss_components.pdf")
+        plt.close(fig)
 
 
 def bw(config, metrics):
@@ -165,12 +195,27 @@ def bins(metrics, config):
 
 
 def cuts(config, metrics):
-    for k in config.opt_cuts:
-        cut_var = "cut_" + k
-        plt.plot(metrics[cut_var][:])
-        plt.ylabel(k + " cut")
-        plt.xlabel("Batch")
-        fig_finalize(config, cut_var + ".pdf")
+    for k, cut_dict in config.opt_cuts.items():
+        if cut_dict.get("keep") == "window":
+            lo = metrics[f"cut_{k}_lo"][:]
+            hi = metrics[f"cut_{k}_hi"][:]
+            batches = np.arange(len(lo))
+            fig, ax = plt.subplots()
+            ax.plot(batches, lo, label="lower bound")
+            ax.plot(batches, hi, label="upper bound")
+            ax.fill_between(batches, lo, hi, alpha=0.2, label="window")
+            ax.set_ylabel(k + " window cut")
+            ax.set_xlabel("Batch")
+            ax.legend()
+            plt.tight_layout()
+            fig_finalize(config, f"cut_{k}.pdf")
+            plt.close(fig)
+        else:
+            cut_var = "cut_" + k
+            plt.plot(metrics[cut_var][:])
+            plt.ylabel(k + " cut")
+            plt.xlabel("Batch")
+            fig_finalize(config, cut_var + ".pdf")
 
 
 def sharp_hist_deviation(config, metrics):
@@ -368,12 +413,12 @@ def movie(config, metrics):
                     ymax = max(ymax, current_max)
 
 
-            do_log = True
+            do_log = False
             if do_log:
                 plt.yscale("log")
                 ax.set_ylim([1e-3, ymax*10])
             else:
-                ax.set_ylim([0, ymax*1.1])
+                ax.set_ylim([0, ymax*1.001])
             fig_finalize(
                 config,
                 name="gif_images/" + f"{i:005d}" + ".png",

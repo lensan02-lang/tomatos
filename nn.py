@@ -10,8 +10,8 @@ from functools import partial
 class NeuralNetwork(eqx.Module):
     layers: list
 
-    def __init__(self, n_features, last_layer_scale=5.0):
-        key = jax.random.PRNGKey(seed=0) # Make this configurable?!
+    def __init__(self, n_features, last_layer_scale=5.0, dropout_p=0.0):
+        key = jax.random.PRNGKey(seed=0)
         key1, key2, key3 = jax.random.split(key, 3)
         last_linear = eqx.nn.Linear(100, 1, key=key3)
         # scale up last layer so initial sigmoid outputs span [0.1, 0.9] instead
@@ -22,15 +22,27 @@ class NeuralNetwork(eqx.Module):
         self.layers = [
             eqx.nn.Linear(n_features, 100, key=key1),
             jax.nn.relu,
+            eqx.nn.Dropout(p=dropout_p),
             eqx.nn.Linear(100, 100, key=key2),
             jax.nn.relu,
+            eqx.nn.Dropout(p=dropout_p),
             last_linear,
             jax.nn.sigmoid,
         ]
 
-    def __call__(self, x):
+    def __call__(self, x, key=None, inference=True):
+        # fold_in works with abstract JAX keys (unlike split + iter)
+        dropout_idx = 0
         for layer in self.layers:
-            x = layer(x)
+            if isinstance(layer, eqx.nn.Dropout):
+                if key is not None:
+                    subkey = jax.random.fold_in(key, dropout_idx)
+                    dropout_idx += 1
+                    x = layer(x, key=subkey, inference=inference)
+                else:
+                    x = layer(x, inference=True)
+            else:
+                x = layer(x)
         return x
 
 # this is not optimized and adds a multihead attention, but works

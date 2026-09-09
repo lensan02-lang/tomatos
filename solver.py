@@ -8,14 +8,10 @@ import tomatos.pipeline
 import tomatos.utils
 
 
-def setup(config, pars):
-    # there are many schedules you can play with
-    # https://optax.readthedocs.io/en/latest/api/optimizer_schedules.html#
-
-    # this has worked particularly well and has a strong regularization effect
-    # due to in between large lr
+def build_lr_schedule(config):
+    """Build the base LR schedule (without plateau reduction)."""
     if "linear_cycle" in config.lr_schedule:
-        lr_schedule = optax.linear_onecycle_schedule(
+        return optax.linear_onecycle_schedule(
             transition_steps=config.num_steps,
             peak_value=config.lr,
             pct_start=0.3,
@@ -24,7 +20,22 @@ def setup(config, pars):
             pct_final=0.9,
         )
     elif "constant" in config.lr_schedule:
-        lr_schedule = optax.constant_schedule(config.lr)
+        if hasattr(config, "bce_warmup_steps") and "cls" in config.objective:
+            return optax.join_schedules(
+                [
+                    optax.constant_schedule(config.lr),
+                    optax.constant_schedule(config.lr * config.cls_lr_factor),
+                ],
+                boundaries=[config.bce_warmup_steps],
+            )
+        else:
+            return optax.constant_schedule(config.lr)
+    raise ValueError(f"Unknown lr_schedule: {config.lr_schedule}")
+
+
+def setup(config, pars, lr_schedule=None):
+    if lr_schedule is None:
+        lr_schedule = build_lr_schedule(config)
 
     learning_rates = [lr_schedule(i) for i in range(config.num_steps)]
 
@@ -56,8 +67,8 @@ def setup(config, pars):
                 mask(pars, ["bins"]),
             ),
             optax.masked(
-                optax.set_to_zero(),  # no update for bw in bce
-                mask(pars, [f"cut_{var}" for var in config.opt_cuts.keys()]),
+                optax.set_to_zero(),  # no update for cuts in bce
+                mask(pars, [key for key in pars.keys() if "cut_" in key]),
             ),
             optax.add_decayed_weights(1e-4)
         )
@@ -66,6 +77,10 @@ def setup(config, pars):
             optax.zero_nans(),  # if nans, zero out, otherwise opt breaks entirely
             optax.clip_by_global_norm(1.0),  # prevent gradient explosion → NaN cascade
             optax.adam(lr_schedule),
+            optax.masked(
+                optax.add_decayed_weights(1e-3),  # only NN weights, not cuts/bw
+                mask(pars, ["nn"]),
+            ),
             # optax.add_noise(eta=0.001, gamma=0.5, seed=0),
             optax.masked(
                 optax.clip(max_delta=config.update_limit_bw),
@@ -73,7 +88,14 @@ def setup(config, pars):
             ),
             optax.masked(
                 optax.set_to_zero() if (not config.include_cuts and config.cuts_start_step is None) else optax.clip(max_delta=config.update_limit_cuts),
-                mask(pars, [key for key in pars.keys() if "cut_" in key]),
+                mask(pars, [key for key in pars.keys() if "cut_" in key and not key.endswith("_logwidth")]),
+            ),
+            # cut_*_logwidth lives in log-space (half_width = exp(logwidth)/2)
+            # so it needs its own step-size limit, separate from the linear
+            # [0,1]-scaled cut_*_center/cut_* limit above
+            optax.masked(
+                optax.set_to_zero() if (not config.include_cuts and config.cuts_start_step is None) else optax.clip(max_delta=config.update_limit_cut_width),
+                mask(pars, [key for key in pars.keys() if key.endswith("_logwidth")]),
             ),
 
         )

@@ -117,10 +117,18 @@ def init_opt_pars(config, nn_pars):
     for key in config.opt_cuts:
         var_idx = config.vars.index(key)
         config.opt_cuts[key]["idx"] = var_idx
-        init = config.opt_cuts[key]["init"]
-        init *= config.scaler_scale[var_idx]
-        init += config.scaler_min[var_idx]
-        opt_pars["cut_" + key] = init
+        keep = config.opt_cuts[key]["keep"]
+        if keep == "window":
+            lo_raw, hi_raw = config.opt_cuts[key]["init"]
+            lo = lo_raw * config.scaler_scale[var_idx] + config.scaler_min[var_idx]
+            hi = hi_raw * config.scaler_scale[var_idx] + config.scaler_min[var_idx]
+            opt_pars["cut_" + key + "_center"] = (lo + hi) / 2
+            opt_pars["cut_" + key + "_logwidth"] = np.log(hi - lo)
+        else:
+            init = config.opt_cuts[key]["init"]
+            init *= config.scaler_scale[var_idx]
+            init += config.scaler_min[var_idx]
+            opt_pars["cut_" + key] = init
 
     return opt_pars
 
@@ -128,7 +136,7 @@ def init_opt_pars(config, nn_pars):
 def train_init(config):
     # init nn and opt pars
     key = jax.random.PRNGKey(0)
-    nn_model = tomatos.nn.NeuralNetwork(n_features=config.nn_inputs_idx_end)
+    nn_model = tomatos.nn.NeuralNetwork(n_features=config.nn_inputs_idx_end, dropout_p=getattr(config, "dropout_p", 0.0))
     # split model into parameters to optimize and the nn architecture
     if hasattr(config, "pretrain_params") and config.pretrain_params:
         model_path = os.path.join(config.pretrain_params,f"epoch_00460.eqx")
@@ -177,12 +185,12 @@ def evaluate_losses(opt_pars, config, batch, step=0):
     """Evaluates validation and test losses."""
     valid_data, valid_sf = next(batch["valid"])
     valid_loss, valid_hists = tomatos.pipeline.loss_fn(
-        opt_pars, valid_data, config, valid_sf, validate_only=True, step=step
+        opt_pars, valid_data, config, valid_sf, validate_only=True, step=step,
     )
 
     test_data, test_sf = next(batch["test"])
     test_loss, test_hists = tomatos.pipeline.loss_fn(
-        opt_pars, test_data, config, test_sf, validate_only=True, step=step
+        opt_pars, test_data, config, test_sf, validate_only=True, step=step,
     )
 
     return valid_loss, valid_hists, test_loss, test_hists
@@ -193,9 +201,20 @@ def run(config):
 
     solver, state, opt_pars, batch, best_test_loss = train_init(config)
 
+    # snapshot of cut values at init so we can freeze them before cuts_start_step
+    init_cut_pars = {}
+    for key in config.opt_cuts:
+        if config.opt_cuts[key].get("keep") == "window":
+            init_cut_pars[f"cut_{key}_center"] = float(opt_pars[f"cut_{key}_center"])
+            init_cut_pars[f"cut_{key}_logwidth"] = float(opt_pars[f"cut_{key}_logwidth"])
+        else:
+            init_cut_pars[f"cut_{key}"] = float(opt_pars[f"cut_{key}"])
+
     metrics = {}
     # this holds optimization params like cuts for epochs used for deployment
     infer_metrics = {}
+    non_closure_steps, non_closure_vals, non_closure_errs = [], [], []
+    asimov_steps, asimov_vals = [], []
     # don't overwrite by mistake
     tomatos.train_utils.do_metrics_exist(config)
 
@@ -215,6 +234,17 @@ def run(config):
         metrics["train_loss"] = state.value
         metrics["valid_loss"] = valid_loss
         metrics["test_loss"] = test_loss
+        train_hists = state.aux if isinstance(state.aux, dict) else {}
+
+        metrics["train_cls"] = train_hists.get("_cls", float("nan"))
+        metrics["train_bce"] = train_hists.get("_bce", float("nan"))
+        metrics["train_discovery"] = train_hists.get("_discovery", float("nan"))
+        metrics["valid_cls"] = valid_hists.get("_cls", float("nan"))
+        metrics["valid_bce"] = valid_hists.get("_bce", float("nan"))
+        metrics["valid_discovery"] = valid_hists.get("_discovery", float("nan"))
+        metrics["test_cls"] = test_hists.get("_cls", float("nan"))
+        metrics["test_bce"] = test_hists.get("_bce", float("nan"))
+        metrics["test_discovery"] = test_hists.get("_discovery", float("nan"))
 
         # gradient update
         train_data, train_sf = next(batch["train"])
@@ -226,6 +256,11 @@ def run(config):
             scale=train_sf,
             step=i,
         )
+        """ # freeze cuts until cuts_start_step — optax.add_decayed_weights would
+        # otherwise drift cut params toward 0 before they should be active
+        if config.cuts_start_step is not None and i < config.cuts_start_step:
+            for key, val in init_cut_pars.items():
+                opt_pars[key] = val"""
         # apply limitations
         opt_pars = tomatos.constraints.opt_pars(config, opt_pars)
 
@@ -241,11 +276,30 @@ def run(config):
 
         if "cls" in config.objective or "bce" in config.objective:
             tomatos.train_utils.log_sharp_hists(
-                opt_pars, train_data, config, train_sf, hists, metrics, step=i
+                opt_pars, train_data, config, train_sf, hists, metrics, step=i,
             )
+            if i % 20 == 0:
+                tomatos.train_utils.unc_plot(
+                    config, opt_pars, train_data, train_sf, i,
+                )
             if i%10 == 0:
-                tomatos.train_utils.log_nn_output(metrics, opt_pars, train_data, train_sf, config, i)
-                tomatos.train_utils.log_abcd_closure(config, opt_pars, train_data, train_sf, i)
+                nc, _, nc_err = tomatos.train_utils.log_matrix_cr_closure(
+                    config, opt_pars, train_data, train_sf, i,
+                )
+                if nc is not None and not np.isnan(float(nc)):
+                    non_closure_steps.append(i)
+                    non_closure_vals.append(nc)
+                    non_closure_errs.append(0.0 if nc_err is None or np.isnan(float(nc_err)) else nc_err)
+                tomatos.train_utils.log_sr_comparison(
+                    config, opt_pars, train_data, train_sf, i,
+                )
+                z = tomatos.train_utils.compute_asimov_significance(
+                    config, opt_pars, train_data, train_sf, i,
+                )
+                metrics["discovery"] = float(z)
+                if not np.isnan(z):
+                    asimov_steps.append(i)
+                    asimov_vals.append(z)
             tomatos.train_utils.log_bins(config, metrics, bins, infer_metrics_i)
             tomatos.train_utils.log_cuts(config, opt_pars, metrics, infer_metrics_i)
             tomatos.train_utils.log_bw(metrics, opt_pars)
@@ -269,14 +323,30 @@ def run(config):
         tomatos.utils.clear_caches(config)
 
         end = perf_counter()
+        # cls_var never runs the BCE warmup (see pipeline.loss_fn) - it
+        # trains on the CLs loss from step 0 regardless of bce_warmup_steps
+        in_bce_warmup = config.objective == "cls_nn" and i < config.bce_warmup_steps
         if config.objective in ["cls_nn", "cls_var"]:
-            loss_mode = "bce (warmup)" if i < config.bce_warmup_steps else "cls"
+            loss_mode = "bce (warmup)" if in_bce_warmup else "cls"
         else:
             loss_mode = config.objective
-        logging.info(f"train loss: {state.value} [{loss_mode}]")
+        logging.info(f"train loss: {metrics['train_loss']} [{loss_mode}]")
         logging.info(f"test loss: {test_loss}")
+        if "cls" in config.objective and not in_bce_warmup:
+            logging.info(f"  train CLs: {metrics['train_cls']:.4f}  discovery: {metrics['train_discovery']:.4f}  BCE: {metrics['train_bce']:.4f}")
+            logging.info(f"  valid CLs: {metrics['valid_cls']:.4f}  discovery: {metrics['valid_discovery']:.4f}  BCE: {metrics['valid_bce']:.4f}")
+            logging.info(f"  test  CLs: {metrics['test_cls']:.4f}  discovery: {metrics['test_discovery']:.4f}  BCE: {metrics['test_bce']:.4f}")
         logging.info(f"update took {end-start:.4f}s")
         logging.info("\n")
+
+    if non_closure_steps:
+        tomatos.train_utils.plot_non_closure_history(
+            config, non_closure_steps, non_closure_vals, non_closure_errs
+        )
+    if asimov_steps:
+        tomatos.train_utils.plot_asimov_history(
+            config, asimov_steps, asimov_vals
+        )
 
     logging.info("Training Done!")
     return

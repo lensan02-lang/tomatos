@@ -12,7 +12,7 @@ import logging
 
 config_handler.set_global(enrich_print=False)
 
-pyhf.set_backend("jax", default=True, precision="32b")
+pyhf.set_backend("jax", default=True, precision="64b")
 
 jax.config.update("jax_enable_x64", True)
 # avoid some warnings on cpu
@@ -115,6 +115,52 @@ class Setup:
         if not hasattr(self, "signal_scale"):
             self.signal_scale = 1.0
 
+        # names of MC samples to subtract from the data-driven ABCD template
+        # (hists[region]["data"]) before it becomes bkg_estimate in
+        # workspace.hist_transforms - e.g. ["ttbar"] to remove a known
+        # contamination from the data-based bkg estimate. empty = off (data
+        # used as-is, the previous default)
+        if not hasattr(self, "subtract_from_data"):
+            self.subtract_from_data = []
+        for sample in self.subtract_from_data:
+            if sample not in self.samples:
+                raise ValueError(
+                    f"subtract_from_data: '{sample}' is not among the "
+                    f"samples found under ntuple_path ({self.samples})"
+                )
+
+        if not hasattr(self, "bce_reg_weight"):
+            self.bce_reg_weight = 0.0
+
+        if not hasattr(self, "cls_anneal_steps"):
+            self.cls_anneal_steps = 1 
+
+        if not hasattr(self, "bce_warmup_steps"):
+            # only meaningful for cls_nn (see pipeline.loss_fn) - cls_var
+            # always trains on the CLs loss directly and never reads this
+            self.bce_warmup_steps = 0
+
+        if not hasattr(self, "entropy_penalty_weight"):
+            self.entropy_penalty_weight = 0.0
+
+        if not hasattr(self, "cls_lr_factor"):
+            self.cls_lr_factor = 1.0
+
+        if not hasattr(self, "signal_bce_weight"):
+            self.signal_bce_weight = 1.0
+
+        if not hasattr(self, "dropout_p"):
+            self.dropout_p = 0.0
+
+        # separate step-size limit for cut_*_logwidth: it lives in log-space
+        # (half_width = exp(logwidth)/2), so the same update_limit_cuts
+        # calibrated for the linear [0,1]-scaled cut_*_center/cut_* would
+        # correspond to a much smaller change in the
+        # actual window width. default to update_limit_cuts for
+        # backwards-compat if not set explicitly.
+        if not hasattr(self, "update_limit_cut_width"):
+            self.update_limit_cut_width = self.update_limit_cuts
+
     def _configure_samples(self, yml):
 
         # collect input files
@@ -160,6 +206,29 @@ class Setup:
         self.preprocess_path = self.results_path + "preprocessed/"
         self.plot_path = self.results_path + "plots/"
         self.gif_path = self.plot_path + "gif_images/"
+        self.abcd_plot_path = self.plot_path + "abcd/"
+        self.sr_plot_path = self.plot_path + "sr/"
+        self.unc_plot_path = self.plot_path + "unc/"
+        eff_json_path = self.efficiencies_path + "efficiency_curves_high.json"
+
+        with open(eff_json_path, "r") as f:
+            raw_eff = json.load(f)
+            self.efficiency_curves = {}
+            for key in ["er_j1", "er_j2", "ef_j1", "ef_j2"]:
+                # prefer the 2D (pT, eta) calibration if the file has one
+                # alongside the plain 1D entry (e.g. "er_j1_pt_eta" next to
+                # "er_j1") - falls back to the 1D entry otherwise, so an old
+                # pt-only efficiency_curves*.json keeps working unchanged.
+                # "efficiency" in the 2D entry has shape
+                # (len(pt_centers), len(eta_centers)).
+                entry = raw_eff.get(f"{key}_pt_eta", raw_eff[key])
+                curve = {
+                    "pt_centers": jax.numpy.array(entry["pt_centers"]),
+                    "efficiency": jax.numpy.array(entry["efficiency"]),
+                }
+                if "eta_centers" in entry:
+                    curve["eta_centers"] = jax.numpy.array(entry["eta_centers"])
+                self.efficiency_curves[key] = curve
 
         # make directories
         for path in [
@@ -168,6 +237,9 @@ class Setup:
             self.preprocess_path,
             self.plot_path,
             self.gif_path,
+            self.abcd_plot_path,
+            self.sr_plot_path,
+            self.unc_plot_path,
         ]:
             os.makedirs(path, exist_ok=True)
 

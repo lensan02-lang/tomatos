@@ -10,16 +10,26 @@ def min_events_per_bin(h, thresh, intensity=0.001):
     return penalty
 
 
-def penalize_loss(loss_value, hists):
-    loss_value += min_events_per_bin(
-        hists["SR_btag_2"]["bkg"]["NOSYS"],
-        thresh=10,
-        intensity=10.0, 
-    )
+def entropy_penalty(h, intensity):
+    # penalize low entropy (= histogram collapse to one bin)
+    # max entropy = log(n_bins), min entropy = 0 (all in one bin)
+    p = h / (jnp.sum(h) + 1e-8)
+    entropy = -jnp.sum(p * jnp.log(p + 1e-8))
+    n_bins = h.shape[0]
+    max_entropy = jnp.log(n_bins)
+    return intensity * (max_entropy - entropy)
+
+
+def penalize_loss(loss_value, hists, config):
     loss_value += min_events_per_bin(
         hists["SR_btag_2"]["bkg_estimate"]["NOSYS"],
         thresh=10,
-        intensity=10.0,
+        intensity=0.001,
+    )
+    # penalize signal and bkg collapsing into one bin
+    loss_value += entropy_penalty(
+        hists["SR_btag_2"]["bkg_estimate"]["NOSYS"],
+        intensity=config.entropy_penalty_weight,
     )
     return loss_value
 
